@@ -49,6 +49,7 @@ class CaptureService : Service() {
     private var thread: HandlerThread? = null
     private var handler: Handler? = null
     private var sender: WledSender? = null
+    private val bars = BarDetector()
 
     private var cfg = Settings()
     private var lastReload = 0L
@@ -114,6 +115,7 @@ class CaptureService : Service() {
     @Suppress("DEPRECATION")
     private fun startCapture(code: Int, data: Intent) {
         stopped = false
+        bars.reset()
         cfg = Settings.load(this)
         lastReload = SystemClock.elapsedRealtime()
         prev = null
@@ -176,11 +178,16 @@ class CaptureService : Service() {
                 return
             }
             val plane = img.planes[0]
-            val sides = sample(plane.buffer, img.width, img.height, plane.rowStride, plane.pixelStride, c)
+            val buf = plane.buffer
+            val w = img.width
+            val h = img.height
+            val rect = contentRect(buf, w, h, plane.rowStride, plane.pixelStride, c)
+            val sides = sample(buf, plane.rowStride, plane.pixelStride, c, rect)
             val colors = Layout.assemble(sides, c)
             process(colors, c)
             sender?.send(c.ip, Layout.toBytes(prev ?: colors))
-            if (status != "Running") status = "Running"
+            val label = runningLabel(c)
+            if (status != label) status = label
         } catch (e: Exception) {
             status = "Error: ${e.message}"
         } finally {
@@ -188,13 +195,52 @@ class CaptureService : Service() {
         }
     }
 
-    /** Average the edge pixels into one color per LED, listed in clockwise order per side. */
-    private fun sample(
+    /** Picture area as [x0, y0, x1, y1]: the whole frame, a fixed 2.39:1 crop, or auto-detected bars. */
+    private fun contentRect(
         buf: ByteBuffer, w: Int, h: Int, rowStride: Int, pixStride: Int, c: Settings
+    ): IntArray {
+        return when (c.aspect) {
+            Layout.ASPECT_FULL -> {
+                bars.reset()
+                intArrayOf(0, 0, w, h)
+            }
+            Layout.ASPECT_WIDE -> {
+                bars.reset()
+                val contentH = (w / 2.39f).roundToInt()
+                val bar = if (contentH < h) (h - contentH) / 2 else 0
+                intArrayOf(0, bar, w, h - bar)
+            }
+            else -> {
+                bars.update(buf, w, h, rowStride, pixStride)
+                intArrayOf(bars.left, bars.top, w - bars.right, h - bars.bottom)
+            }
+        }
+    }
+
+    private fun runningLabel(c: Settings): String = when (c.aspect) {
+        Layout.ASPECT_FULL -> "Running - full screen (manual)"
+        Layout.ASPECT_WIDE -> "Running - widescreen 2.39:1 (manual)"
+        else -> when {
+            bars.hasLetterbox && bars.hasPillarbox -> "Running - black bars on all sides detected"
+            bars.hasLetterbox -> "Running - widescreen detected"
+            bars.hasPillarbox -> "Running - 4:3 detected"
+            else -> "Running - full screen detected"
+        }
+    }
+
+    /** Average the edge pixels of the picture area into one color per LED, clockwise per side. */
+    private fun sample(
+        buf: ByteBuffer, rowStride: Int, pixStride: Int, c: Settings, rect: IntArray
     ): Map<Char, FloatArray> {
         val out = HashMap<Char, FloatArray>()
-        val dx = max(1, (w * c.depth).toInt())
-        val dy = max(1, (h * c.depth).toInt())
+        val x0 = rect[0]
+        val y0 = rect[1]
+        val x1 = rect[2]
+        val y1 = rect[3]
+        val cw = max(1, x1 - x0)
+        val ch = max(1, y1 - y0)
+        val dx = max(1, (cw * c.depth).toInt())
+        val dy = max(1, (ch * c.depth).toInt())
         for (side in charArrayOf('T', 'R', 'B', 'L')) {
             val n = c.count(side)
             if (n == 0) {
@@ -203,20 +249,20 @@ class CaptureService : Service() {
             }
             val horizontal = side == 'T' || side == 'B'
             val xs = when (side) {
-                'L' -> 0 until dx
-                'R' -> (w - dx) until w
-                else -> 0 until w
+                'L' -> x0 until (x0 + dx)
+                'R' -> (x1 - dx) until x1
+                else -> x0 until x1
             }
             val ys = when (side) {
-                'T' -> 0 until dy
-                'B' -> (h - dy) until h
-                else -> 0 until h
+                'T' -> y0 until (y0 + dy)
+                'B' -> (y1 - dy) until y1
+                else -> y0 until y1
             }
             val sum = IntArray(n * 3)
             val cnt = IntArray(n)
             for (y in ys) {
                 for (x in xs) {
-                    val seg = if (horizontal) x * n / w else y * n / h
+                    val seg = if (horizontal) (x - x0) * n / cw else (y - y0) * n / ch
                     val idx = y * rowStride + x * pixStride
                     sum[seg * 3] += buf.get(idx).toInt() and 0xFF
                     sum[seg * 3 + 1] += buf.get(idx + 1).toInt() and 0xFF

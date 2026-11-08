@@ -14,6 +14,11 @@ object Layout {
         'L' to floatArrayOf(255f, 200f, 0f)
     )
 
+    const val ASPECT_AUTO = "Auto (detect black bars)"
+    const val ASPECT_FULL = "Full screen"
+    const val ASPECT_WIDE = "Widescreen 2.39:1"
+    val ASPECTS = listOf(ASPECT_AUTO, ASPECT_FULL, ASPECT_WIDE)
+
     val STARTS = listOf("Bottom-left", "Top-left", "Top-right", "Bottom-right")
     val DIRECTIONS = listOf("Clockwise", "Counter-clockwise")
 

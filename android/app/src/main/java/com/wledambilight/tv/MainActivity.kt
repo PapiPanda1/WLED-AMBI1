@@ -38,6 +38,7 @@ class MainActivity : Activity() {
     private val edits = HashMap<String, EditText>()
     private lateinit var startSpinner: Spinner
     private lateinit var dirSpinner: Spinner
+    private lateinit var aspectSpinner: Spinner
     private lateinit var orderText: TextView
     private lateinit var statusText: TextView
     private lateinit var startBtn: Button
@@ -89,6 +90,15 @@ class MainActivity : Activity() {
             setPadding(0, dp(8), 0, 0)
         }
         col.addView(orderText)
+
+        section(col, "Screen content (widescreen / full screen)")
+        aspectSpinner = spinner(col, "Picture area", Layout.ASPECTS, s.aspect)
+        col.addView(TextView(this).apply {
+            textSize = 14f
+            setPadding(0, dp(4), 0, 0)
+            text = "Auto ignores black bars on movies (widescreen) or 4:3 shows so the LEDs " +
+                "match the picture. If it guesses wrong, pick Full screen or Widescreen 2.39:1."
+        })
 
         section(col, "Look")
         field(col, "FPS (1-60)", "fps", s.fps.toString(), NUM)
@@ -207,7 +217,8 @@ class MainActivity : Activity() {
             brightness = f("brightness", s.brightness).coerceIn(0f, 1f),
             gamma = f("gamma", s.gamma).coerceIn(0.5f, 3f),
             depth = f("depth", s.depth).coerceIn(0.02f, 0.5f),
-            blackCutoff = i("blackCutoff", s.blackCutoff).coerceIn(0, 255)
+            blackCutoff = i("blackCutoff", s.blackCutoff).coerceIn(0, 255),
+            aspect = aspectSpinner.selectedItem as? String ?: s.aspect
         )
     }
 

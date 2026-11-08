@@ -17,7 +17,8 @@ data class Settings(
     val brightness: Float = 1f,
     val gamma: Float = 1f,
     val depth: Float = 0.12f,
-    val blackCutoff: Int = 0
+    val blackCutoff: Int = 0,
+    val aspect: String = Layout.ASPECT_AUTO
 ) {
     fun count(side: Char): Int {
         val n = when (side) {
@@ -49,6 +50,7 @@ data class Settings(
             .putFloat("gamma", gamma)
             .putFloat("depth", depth)
             .putInt("blackCutoff", blackCutoff)
+            .putString("aspect", aspect)
             .apply()
     }
 
@@ -73,7 +75,8 @@ data class Settings(
                 brightness = p.getFloat("brightness", d.brightness),
                 gamma = p.getFloat("gamma", d.gamma),
                 depth = p.getFloat("depth", d.depth),
-                blackCutoff = p.getInt("blackCutoff", d.blackCutoff)
+                blackCutoff = p.getInt("blackCutoff", d.blackCutoff),
+                aspect = p.getString("aspect", d.aspect) ?: d.aspect
             )
         }
     }
