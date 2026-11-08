@@ -51,6 +51,7 @@ DEFAULTS = {
     "brightness": 1.0,
     "gamma": 1.0,
     "black_threshold": 0,
+    "aspect": "Auto (detect black bars)",
     "autostart": False,
 }
 
@@ -107,18 +108,81 @@ def describe_order(cfg):
 # --------------------------------------------------------------------------
 # Capture + streaming
 # --------------------------------------------------------------------------
-def edge_segments(region, count, horizontal):
-    """Average a captured edge strip into `count` colors (natural screen order)."""
-    rgb = region[::3, ::3, :3][:, :, ::-1].astype(np.float32)  # BGRA -> RGB
-    axis_len = rgb.shape[1] if horizontal else rgb.shape[0]
-    idx = np.array_split(np.arange(axis_len), count)
+def edge_segments(strip, count, horizontal):
+    """Average an RGB edge strip into `count` colors (natural screen order)."""
+    rgb = strip.astype(np.float32)
+    profile = rgb.mean(axis=0) if horizontal else rgb.mean(axis=1)  # (length, 3)
     out = np.zeros((count, 3), dtype=np.float32)
-    for i, ix in enumerate(idx):
-        if len(ix) == 0:
-            continue
-        chunk = rgb[:, ix[0]:ix[-1] + 1] if horizontal else rgb[ix[0]:ix[-1] + 1]
-        out[i] = chunk.reshape(-1, 3).mean(axis=0)
+    for i, chunk in enumerate(np.array_split(profile, count)):
+        if len(chunk):
+            out[i] = chunk.mean(axis=0)
     return out
+
+
+ASPECT_AUTO = "Auto (detect black bars)"
+ASPECT_FULL = "Full screen"
+ASPECT_WIDE = "Widescreen 2.39:1"
+ASPECTS = [ASPECT_AUTO, ASPECT_FULL, ASPECT_WIDE]
+
+
+class BarDetector:
+    """Finds black bars around the picture (letterbox for widescreen, pillarbox for 4:3).
+
+    Bars are only adopted once stable for a moment, which avoids flicker on dark scenes.
+    """
+    BLACK = 28          # brightest channel value still counted as "black"
+    MAX_FRACTION = 0.4  # bars larger than this are treated as a dark scene
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.top = self.bottom = self.left = self.right = 0
+        self.cand = (0, 0, 0, 0)
+        self.count = 0
+
+    @property
+    def has_letterbox(self):
+        return self.top > 0 or self.bottom > 0
+
+    @property
+    def has_pillarbox(self):
+        return self.left > 0 or self.right > 0
+
+    def _measure(self, rgb):
+        """Return (top, bottom, left, right) bar sizes, or None for a mostly black frame."""
+        h, w = rgb.shape[:2]
+        bright = rgb.max(axis=2) > self.BLACK
+        rows = np.flatnonzero(bright.mean(axis=1) > 0.02)
+        if len(rows) == 0:
+            return None
+        t, b = int(rows[0]), int(h - 1 - rows[-1])
+        inner = bright[t:h - b]  # judge columns only over the picture rows
+        cols = np.flatnonzero(inner.mean(axis=0) > 0.02)
+        if len(cols) == 0:
+            return None
+        l, r = int(cols[0]), int(w - 1 - cols[-1])
+        if t >= h * self.MAX_FRACTION or b >= h * self.MAX_FRACTION \
+                or l >= w * self.MAX_FRACTION or r >= w * self.MAX_FRACTION:
+            return None
+        # Real bars appear on both sides; use the larger one (subtitles shorten one bar).
+        min_v, min_h = max(2, h // 50), max(2, w // 50)
+        v = max(t, b) if t >= min_v and b >= min_v else 0
+        z = max(l, r) if l >= min_h and r >= min_h else 0
+        return (v, v, z, z)
+
+    def update(self, rgb):
+        m = self._measure(rgb)
+        if m is None:  # dark frame: keep the last result
+            return
+        if all(abs(a - b) <= 1 for a, b in zip(m, self.cand)):
+            self.count += 1
+        else:
+            self.cand, self.count = m, 1
+        current = (self.top, self.bottom, self.left, self.right)
+        shrinking = all(a <= b for a, b in zip(m, current))
+        if self.count >= (3 if shrinking else 20):
+            self.top, self.bottom, self.left, self.right = self.cand
 
 
 def send_frame(sock, addr, colors, timeout=2):
@@ -135,6 +199,8 @@ def worker(get_cfg, stop, set_status, test=False):
     try:
         with mss.mss() as sct:
             prev = None
+            detector = BarDetector()
+            last_label = None
             set_status("Testing pattern..." if test else "Running")
             while not stop.is_set():
                 t0 = time.perf_counter()
@@ -164,21 +230,51 @@ def worker(get_cfg, stop, set_status, test=False):
                     time.sleep(0.5)
                     continue
                 mon = sct.monitors[cfg["monitor"]]
-                W, H = mon["width"], mon["height"]
-                dx = max(8, int(W * cfg["depth"]))
-                dy = max(8, int(H * cfg["depth"]))
-                regions = {
-                    "L": {"left": mon["left"], "top": mon["top"], "width": dx, "height": H},
-                    "R": {"left": mon["left"] + W - dx, "top": mon["top"], "width": dx, "height": H},
-                    "T": {"left": mon["left"], "top": mon["top"], "width": W, "height": dy},
-                    "B": {"left": mon["left"], "top": mon["top"] + H - dy, "width": W, "height": dy},
+                # One full-frame grab, shrunk to ~480px wide, then everything works on that.
+                step = max(1, mon["width"] // 480)
+                frame = np.asarray(sct.grab(mon))[::step, ::step, :3][:, :, ::-1]  # RGB
+                h, w = frame.shape[:2]
+                aspect = cfg.get("aspect", ASPECT_AUTO)
+                if aspect == ASPECT_FULL:
+                    detector.reset()
+                    x0, y0, x1, y1 = 0, 0, w, h
+                    label = "full screen (manual)"
+                elif aspect == ASPECT_WIDE:
+                    detector.reset()
+                    content_h = int(round(w / 2.39))
+                    bar = (h - content_h) // 2 if content_h < h else 0
+                    x0, y0, x1, y1 = 0, bar, w, h - bar
+                    label = "widescreen 2.39:1 (manual)"
+                else:
+                    detector.update(frame)
+                    x0, y0 = detector.left, detector.top
+                    x1, y1 = w - detector.right, h - detector.bottom
+                    if detector.has_letterbox and detector.has_pillarbox:
+                        label = "black bars on all sides detected"
+                    elif detector.has_letterbox:
+                        label = "widescreen detected"
+                    elif detector.has_pillarbox:
+                        label = "4:3 detected"
+                    else:
+                        label = "full screen detected"
+                if label != last_label:
+                    last_label = label
+                    set_status("Running - " + label)
+
+                cw, ch = max(1, x1 - x0), max(1, y1 - y0)
+                dx = max(2, int(cw * cfg["depth"]))
+                dy = max(2, int(ch * cfg["depth"]))
+                strips = {
+                    "L": frame[y0:y1, x0:x0 + dx],
+                    "R": frame[y0:y1, max(x0, x1 - dx):x1],
+                    "T": frame[y0:y0 + dy, x0:x1],
+                    "B": frame[max(y0, y1 - dy):y1, x0:x1],
                 }
                 for s, n in counts.items():
                     if n <= 0:
                         side_colors[s] = np.zeros((0, 3), dtype=np.float32)
                         continue
-                    img = np.asarray(sct.grab(regions[s]))
-                    seg = edge_segments(img, n, s in "TB")
+                    seg = edge_segments(strips[s], n, s in "TB")
                     # Clockwise: top L->R, right T->B, bottom R->L, left B->T
                     if s in "BL":
                         seg = seg[::-1]
@@ -280,6 +376,11 @@ class App:
         self.add_spin(box, "Gamma", "gamma", float, cfg, 2, 2, 0.5, 3, 0.1)
         self.add_spin(box, "Sample depth", "depth", float, cfg, 3, 0, 0.02, 0.5, 0.02)
         self.add_spin(box, "Black cutoff (0-255)", "black_threshold", int, cfg, 3, 2, 0, 255)
+        self.add_combo(box, "Picture area", "aspect", ASPECTS, cfg, 4, 0)
+        ttk.Label(box, foreground="#666", wraplength=400, text=(
+            "Auto ignores black bars on movies (widescreen) or 4:3 shows so the LEDs "
+            "match the picture. If it guesses wrong, pick Full screen or Widescreen 2.39:1."
+        )).grid(row=5, column=0, columnspan=4, sticky="w", padx=6, pady=(0, 4))
 
         # Buttons
         bar = ttk.Frame(main)
@@ -329,7 +430,7 @@ class App:
         ttk.Label(parent, text=label).grid(row=r, column=c, sticky="w", padx=6, pady=3)
         var = tk.StringVar(value=str(cfg[key]))
         ttk.Combobox(parent, textvariable=var, values=values, state="readonly",
-                     width=18).grid(row=r, column=c + 1, columnspan=2, sticky="w", padx=6, pady=3)
+                     width=24).grid(row=r, column=c + 1, columnspan=2, sticky="w", padx=6, pady=3)
         self.vars[key], self.types[key] = var, str
 
     # --- config ---
